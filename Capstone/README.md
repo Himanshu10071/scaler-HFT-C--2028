@@ -207,4 +207,10 @@ Implementation C
 
 Note: these counts cover the whole program, so they include building the workload too. That part is identical for all three.
 
-Unavailable counters: cycles, instructions, branches, branch-misses, cache-misses, L1-dcache-load-misses and dTLB-load-misses are all `<not supported>` on WSL2. We still need to run `run_perf.sh` on a lab Linux machine to get these and fill in the rest of the table in REPORT.md.
+Unavailable counters: cycles, instructions, branches, branch-misses, cache-misses, L1-dcache-load-misses and dTLB-load-misses are all `<not supported>` for us. WSL2 runs inside Hyper-V, which doesn't pass the CPU's hardware counters to the Linux VM. The WSL kernel says so itself at boot:
+
+```
+Performance Events: unsupported CPU family 6 model 186 no PMU driver, software events only.
+```
+
+`perf list hw` prints nothing (see `results/pmu_check.txt`). So we report task-clock and page-faults, which did work, and the perf record profiles. On a normal Linux install `run_perf.sh` collects all of the counters without any changes.

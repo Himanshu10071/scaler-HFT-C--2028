@@ -12,14 +12,17 @@ Machine: i5-13420H laptop, WSL2 Ubuntu 26.04, g++ 15.2 with `-O2`, perf 7.0. The
 | ns / add | 206.8 | 179.2 | 53.7 |
 | ns / cancel | 519.3 | 1080.2 | 143.9 |
 | ns / BBO | 19.5 | 18.9 | 19.1 |
-| IPC | TODO (lab machine) | TODO (lab machine) | TODO (lab machine) |
-| Branch misses (%) | TODO (lab machine) | TODO (lab machine) | TODO (lab machine) |
-| L1-dcache-load-misses | TODO (lab machine) | TODO (lab machine) | TODO (lab machine) |
-| Cache misses | TODO (lab machine) | TODO (lab machine) | TODO (lab machine) |
+| IPC | not available (WSL2) | not available (WSL2) | not available (WSL2) |
+| Branch misses (%) | not available (WSL2) | not available (WSL2) | not available (WSL2) |
+| L1-dcache-load-misses | not available (WSL2) | not available (WSL2) | not available (WSL2) |
+| Cache misses | not available (WSL2) | not available (WSL2) | not available (WSL2) |
+| dTLB-load-misses | not available (WSL2) | not available (WSL2) | not available (WSL2) |
 | Page faults | 19,305 | 21,713 | 22,164 |
 | task-clock, whole program (ms) | 369.32 | 463.04 | 139.79 |
 
-The four TODO rows need hardware counters, and WSL2 reports them as `<not supported>`. dTLB-load-misses is missing for the same reason. The numbers move around a fair bit between runs on this laptop (perf shows up to 8% spread for A), so we only trust differences that are much bigger than that.
+We only have a Windows laptop, so everything ran inside WSL2. WSL2 is a Hyper-V virtual machine and Hyper-V doesn't hand the CPU's hardware counters to it. At boot the WSL kernel prints `Performance Events: unsupported CPU family 6 model 186 no PMU driver, software events only`, and `perf list hw` comes back empty (saved in `results/pmu_check.txt`). So cycles, instructions, branches, branch-misses, cache-misses, L1-dcache-load-misses and dTLB-load-misses all show `<not supported>`. task-clock and page-faults are software counters and those worked. perf record also worked, it just samples on a timer instead of on cycles.
+
+The numbers move around a fair bit between runs on this laptop (perf shows up to 8% spread for A), so we only trust differences that are much bigger than that.
 
 perf record, top functions (self time):
 
@@ -47,23 +50,23 @@ B's cancel is the worst at 1080 ns. A random id means a walk down about 19 level
 
 ## 11.2 Branch prediction
 
-We couldn't measure branch-misses on WSL, so this part is what we expect from reading the code. We still need to check it on the lab machine.
+We couldn't measure branch-misses (see above), so this part comes from reading the code and from where perf record says the time goes.
 
-We think B will have the most branch misses. Every cancel goes down the order tree and every add or cancel also runs our binary search over the level vector. At each step of both, whether we go left or right depends on a random id or a random price, so the CPU is basically guessing and gets it wrong about half the time. That is around 19 + 13 hard branches per cancel.
+We think B has the most branch misses. Every cancel goes down the order tree and every add or cancel also runs our binary search over the level vector. At each step of both, whether we go left or right depends on a random id or a random price, so the CPU is basically guessing and gets it wrong about half the time. That is around 19 + 13 hard branches per cancel.
 
 A has the same problem in its level tree (about 12 levels), but its order lookup is a hash, which has only a couple of branches per lookup. C has very few data dependent branches. The `if (tick > best_bid)` check is almost always false once the book fills up, and the scan loop in cancel almost never runs because with 500k orders spread over 10,000 ticks a level is very rarely emptied.
 
 ## 11.3 Cache behaviour
 
-Again we don't have cache-miss counts yet, but the layouts are quite different.
+We don't have cache-miss counts either, so this is from looking at how each book lays out its memory.
 
-A and B both allocate a separate heap node for every order (an `unordered_map` node in A, a tree node in B), so about 500k small objects are live at the end. These end up spread over roughly 25 to 35 MB of heap, and finding one means following pointers. Each pointer hop can be a cache miss, and with random cancel ids most of them are. B is hit harder because a tree lookup is about 19 hops and a hash lookup is about 2.
+A and B both allocate a separate heap node for every order (an `unordered_map` node in A, a tree node in B), so about 500k small objects are live at the end. These end up spread over roughly 25 to 35 MB of heap, and finding one means following pointers. Each pointer hop can be a cache miss, and with random cancel ids a lot of them probably are. B is hit harder because a tree lookup is about 19 hops and a hash lookup is about 2.
 
 The level storage in A is also a tree (5000 nodes per side), but that is small enough to stay mostly in L2. B's level vectors are contiguous and only 80 KB per side, so that part of B is cache friendly. It just doesn't matter much next to the order tree.
 
 C's level array is one contiguous block of 120 KB that stays in L2, and the depth walk reads it in order. The order vector is about 17 MB, so a cancel of a random id is still a cache miss, but it is exactly one miss with no pointers to follow. We think this is most of the 144 ns cancel time in C.
 
-We expect C to show the fewest cache misses and B the most once we get the lab numbers.
+Our guess is C has the fewest cache misses and B the most. The timings fit that. B's cancel is the slowest thing in the whole benchmark at 1080 ns, and it's also the op with the most pointer hops. A trip to main memory is somewhere around 80 to 100 ns, so 1080 ns is roughly what you'd get from ten or so misses in a row. C's cancel at 144 ns looks more like one or two.
 
 ## 11.4 Page faults
 
@@ -73,17 +76,15 @@ C being the highest was not what we expected, since it is the fastest. There are
 
 A has the fewest because when an order is cancelled its hash node is freed, and the next add can reuse that memory without a new page. B also reuses freed nodes, but a tree node is bigger than a hash node, so it needs more pages overall.
 
-So page faults here are mostly about how much memory the program touches overall, not about how fast each operation is.
-
 ## 11.5 Production choice
 
 We would pick C, but not as it is now.
 
-On latency it is clearly ahead: about 54 ns to add and 144 ns to cancel, against 200 to 1000 ns for the other two. It is also more predictable. Every add and cancel does about the same small amount of work. A has occasional rehashes, and A and B call malloc and free on every add and cancel, and malloc time varies. C's one bad case is a cancel that empties the best level, where it scans until it finds the next non-empty tick. With a band of 5000 ticks that scan has a hard upper limit, and in a busy book it is short.
+On latency it is clearly ahead: about 54 ns to add and 144 ns to cancel, while the other two are somewhere between 179 and 1080 ns. It is also more predictable. Every add and cancel does about the same small amount of work. A has occasional rehashes, and A and B call malloc and free on every add and cancel, and malloc time varies. C's one bad case is a cancel that empties the best level, where it scans until it finds the next non-empty tick. With a band of 5000 ticks that scan has a hard upper limit, and in a busy book it is short.
 
 Memory is where C is weakest right now. The level array is fixed and small (120 KB), which is fine. The order vector is the problem, because it grows with every id ever seen. In a real system ids come from the exchange and are not small and dense like ours, so we would need to map them to slot numbers ourselves and reuse slots after a cancel (a free list). With that change the memory would be fixed and could be allocated once at startup.
 
-On maintainability A is the nicest. It is short, uses containers everyone knows, and is hard to get wrong. C has more ways to break. If best_bid isn't updated correctly, every BBO after that is wrong, which is exactly why we built the --verify mode. We would still go with C plus the slot mapping, keep A around as the reference in tests, and keep running the same comparison against it.
+On maintainability A is the nicest. It is short, uses containers everyone knows, and is hard to get wrong. C has more ways to break. If best_bid isn't updated correctly, every BBO after that is wrong. That's the main reason --verify checks the BBO after every single op. We would still go with C plus the slot mapping, and keep A as the reference in the tests.
 
 ## 11.6 What we would try next
 
@@ -92,3 +93,4 @@ On maintainability A is the nicest. It is short, uses containers everyone knows,
 - In C, keep a bitmap of non-empty ticks so finding the next best level is a few word scans instead of a loop over every tick.
 - In A, call `reserve()` on the unordered_map up front and replace the count + operator[] pair with a single `emplace`.
 - Take out `double` from the API entirely and pass ticks as ints.
+- Run `run_perf.sh` on a normal Linux install (not a VM) to get the hardware counters and see if our guesses in 11.2 and 11.3 are right.
